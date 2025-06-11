@@ -84,6 +84,17 @@ export const navConfig: NavItem[] = [
     icon: Presentation,
     roles: ['Instructor'],
   },
+  {
+    title: 'Divulgación General',
+    href: '#',
+    icon: Newspaper,
+    roles: ['Instructor'], // Added Instructor role
+    children: [
+      { title: 'Páginas Informativas', href: '/personal/divulgacion/paginas', icon: FileText, roles: ['Instructor', 'Personal'] }, // Assuming instructors share personal pages
+      { title: 'Políticas y Documentos', href: '/personal/divulgacion/documentos', icon: ScrollText, roles: ['Instructor', 'Personal'] }, // Assuming instructors share personal pages
+      { title: 'Anuncios Recientes', href: '/personal/divulgacion/anuncios', icon: Megaphone, roles: ['Instructor', 'Personal'] }, // Assuming instructors share personal pages
+    ],
+  },
 
   // Personal
   {
@@ -117,6 +128,6 @@ export const navConfig: NavItem[] = [
     title: 'Mi Perfil',
     href: '/personal/perfil',
     icon: Users,
-    roles: allRoles,
+    roles: allRoles, // Ensures all roles including Instructor can see this
   },
 ];
