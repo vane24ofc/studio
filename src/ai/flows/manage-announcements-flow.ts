@@ -10,12 +10,14 @@
  * - AnnouncementSchema - Zod schema for an announcement.
  * - CreateAnnouncementInputSchema - Zod schema for creating an announcement.
  * - UpdateAnnouncementInputSchema - Zod schema for updating an announcement.
+ * - UrgencyLevelFlow - Type for urgency levels.
+ * - TargetAudienceRoleFlow - Type for target audience roles.
  */
 
 import { ai } from '@/ai/genkit';
 import { z } from 'genkit/zod';
 import mysql from 'mysql2/promise';
-import type { UserRole as AppUserRole } from '@/types';
+// import type { UserRole as AppUserRole } from '@/types'; // Not currently used, can be added if needed for author based on logged-in user
 
 
 const dbConfig = {
@@ -84,17 +86,17 @@ export type Announcement = z.infer<typeof AnnouncementSchema>;
 
 export const CreateAnnouncementInputSchema = AnnouncementSchema.omit({ 
     id: true, 
-    author: true, 
+    author: true, // Author will be set by backend or passed if available from session
     createdAt: true, 
     updatedAt: true 
 });
 export type CreateAnnouncementInput = z.infer<typeof CreateAnnouncementInputSchema>;
 
 export const UpdateAnnouncementInputSchema = AnnouncementSchema.omit({ 
-    author: true, 
-    createdAt: true, 
-    updatedAt: true 
-}).partial(); 
+    author: true, // Author generally should not be updated this way
+    createdAt: true, // createdAt is immutable
+    updatedAt: true // updatedAt is set by the backend on update
+}).partial(); // .partial() makes all fields optional for updates
 export type UpdateAnnouncementInput = z.infer<typeof UpdateAnnouncementInputSchema>;
 
 
@@ -113,13 +115,13 @@ const createAnnouncementFlow = ai.defineFlow(
     try {
       connection = await getConnection();
       const now = new Date().toISOString();
-      const newId = \`ann-\${Date.now()}-\${Math.random().toString(36).substring(7)}\`; 
-      const author = 'Usuario Actual (Backend)'; // TODO: Replace with actual user context
+      const newId = `ann-${Date.now()}-${Math.random().toString(36).substring(7)}`; 
+      const author = 'Usuario Actual (Backend)'; // TODO: Replace with actual user context if available
 
-      const sql = \`
+      const sql = `
         INSERT INTO announcements (id, title, content, urgency, publicationDate, expirationDate, author, targetAudience, isPublished, isSticky, createdAt, updatedAt)
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-      \`;
+      `;
       const values = [
         newId,
         input.title,
@@ -127,7 +129,7 @@ const createAnnouncementFlow = ai.defineFlow(
         input.urgency,
         new Date(input.publicationDate).toISOString(),
         input.expirationDate ? new Date(input.expirationDate).toISOString() : null,
-        author,
+        author, // Using the backend-defined author for now
         JSON.stringify(input.targetAudience), 
         input.isPublished,
         input.isSticky,
@@ -139,6 +141,7 @@ const createAnnouncementFlow = ai.defineFlow(
       await connection.execute(sql, values);
       console.log('SQL execution successful for createAnnouncementFlow. ID:', newId);
 
+      // Construct the full Announcement object to return, matching AnnouncementSchema
       const newAnnouncement: Announcement = {
         ...input,
         id: newId,
@@ -169,7 +172,7 @@ export async function createAnnouncement(input: CreateAnnouncementInput): Promis
 const getAnnouncementsFlow = ai.defineFlow(
   {
     name: 'getAnnouncementsFlow',
-    inputSchema: z.undefined(), 
+    inputSchema: z.undefined(), // No input for getting all announcements
     outputSchema: z.array(AnnouncementSchema),
   },
   async () => {
@@ -185,20 +188,21 @@ const getAnnouncementsFlow = ai.defineFlow(
       const [rows] = await connection.execute(sql);
       console.log('SQL execution successful for getAnnouncementsFlow. Rows found:', (rows as any[]).length);
       
+      // Map rows to match AnnouncementSchema, ensuring correct types (JSON parse, boolean conversion)
       const announcements = (rows as any[]).map(row => ({
         ...row,
         targetAudience: typeof row.targetAudience === 'string' ? JSON.parse(row.targetAudience) : row.targetAudience,
-        isPublished: !!row.isPublished,
-        isSticky: !!row.isSticky,
+        isPublished: !!row.isPublished, // Convert TINYINT(1) or similar to boolean
+        isSticky: !!row.isSticky,       // Convert TINYINT(1) or similar to boolean
         publicationDate: new Date(row.publicationDate).toISOString(),
         expirationDate: row.expirationDate ? new Date(row.expirationDate).toISOString() : null,
         createdAt: new Date(row.createdAt).toISOString(),
         updatedAt: new Date(row.updatedAt).toISOString(),
       }));
-      return AnnouncementSchema.array().parse(announcements); 
+      return AnnouncementSchema.array().parse(announcements); // Validate against the schema before returning
     } catch (error) {
       console.error('Error in getAnnouncementsFlow:', error);
-      // Si el error es porque la tabla no existe (ER_NO_SUCH_TABLE), retorna un array vacío.
+      // If the error is because the table does not exist (ER_NO_SUCH_TABLE), return an empty array.
       if ((error as any).code === 'ER_NO_SUCH_TABLE') {
         console.warn('Table "announcements" does not exist. Returning empty array for getAnnouncementsFlow.');
         return [];
@@ -240,13 +244,17 @@ const updateAnnouncementFlow = ai.defineFlow(
       const values: any[] = [];
 
       Object.entries(data).forEach(([key, value]) => {
-        if (value !== undefined) {
-          fieldsToUpdate.push(\`\`\${key}\` = ?\`);
+        if (value !== undefined) { // Only include fields that are actually being updated
+          fieldsToUpdate.push(`\`${key}\` = ?`);
           if (key === 'targetAudience' && Array.isArray(value)) {
             values.push(JSON.stringify(value));
           } else if ((key === 'publicationDate' || key === 'expirationDate') && value !== null) {
             values.push(new Date(value as string).toISOString());
           } 
+          // Handle boolean conversion explicitly if MySQL driver doesn't do it automatically
+          // else if (typeof value === 'boolean' && (key === 'isPublished' || key === 'isSticky')) {
+          //   values.push(value ? 1 : 0);
+          // } 
           else {
             values.push(value);
           }
@@ -254,11 +262,12 @@ const updateAnnouncementFlow = ai.defineFlow(
       });
 
       if (fieldsToUpdate.length === 0) {
+        // No actual fields to update, just return the current announcement
         console.log('updateAnnouncementFlow: No fields to update for id:', id);
         const [currentRows] = await connection.execute('SELECT * FROM announcements WHERE id = ?', [id]);
         if ((currentRows as any[]).length === 0) {
-            console.error(\`updateAnnouncementFlow: Announcement with id \${id} not found when no fields to update.\`);
-            throw new Error(\`Announcement with id \${id} not found.\`);
+            console.error(`updateAnnouncementFlow: Announcement with id ${id} not found when no fields to update.`);
+            throw new Error(`Announcement with id ${id} not found.`);
         }
         const currentRow = (currentRows as any[])[0];
         return AnnouncementSchema.parse({
@@ -275,18 +284,19 @@ const updateAnnouncementFlow = ai.defineFlow(
 
       fieldsToUpdate.push('`updatedAt` = ?');
       values.push(updatedAt);
-      values.push(id); 
+      values.push(id); // For the WHERE id = ? clause
 
-      const sql = \`UPDATE announcements SET \${fieldsToUpdate.join(', ')} WHERE id = ?\`;
+      const sql = `UPDATE announcements SET ${fieldsToUpdate.join(', ')} WHERE id = ?`;
       console.log('Executing SQL for updateAnnouncementFlow:', sql.trim().substring(0, 100) + '...');
       const [result] = await connection.execute(sql, values);
       console.log('SQL execution result for updateAnnouncementFlow:', result);
       
       if ((result as mysql.ResultSetHeader).affectedRows === 0) {
-        console.error(\`updateAnnouncementFlow: Announcement with id \${id} not found or no changes made.\`);
-        throw new Error(\`Announcement with id \${id} not found or no changes made.\`);
+        console.error(`updateAnnouncementFlow: Announcement with id ${id} not found or no changes made.`);
+        throw new Error(`Announcement with id ${id} not found or no changes made.`);
       }
 
+      // Fetch the updated announcement to return
       const [updatedRows] = await connection.execute('SELECT * FROM announcements WHERE id = ?', [id]);
       const updatedRow = (updatedRows as any[])[0];
        return AnnouncementSchema.parse({
@@ -312,7 +322,10 @@ const updateAnnouncementFlow = ai.defineFlow(
 );
 
 export async function updateAnnouncement(id: string, data: UpdateAnnouncementInput): Promise<Announcement> {
-  return updateAnnouncementFlow({ id, data });
+  // Ensure 'id' is not part of 'data' as it's passed separately
+  const dataWithoutId = { ...data };
+  delete (dataWithoutId as any).id;
+  return updateAnnouncementFlow({ id, data: dataWithoutId });
 }
 
 const deleteAnnouncementFlow = ai.defineFlow(
@@ -335,8 +348,8 @@ const deleteAnnouncementFlow = ai.defineFlow(
       console.log('SQL execution result for deleteAnnouncementFlow:', result);
 
       if ((result as mysql.ResultSetHeader).affectedRows === 0) {
-        console.error(\`deleteAnnouncementFlow: Announcement with id \${id} not found for deletion.\`);
-        throw new Error(\`Announcement with id \${id} not found for deletion.\`);
+        console.error(`deleteAnnouncementFlow: Announcement with id ${id} not found for deletion.`);
+        throw new Error(`Announcement with id ${id} not found for deletion.`);
       }
       return { success: true, id };
     } catch (error) {
@@ -354,5 +367,10 @@ const deleteAnnouncementFlow = ai.defineFlow(
 export async function deleteAnnouncement(id: string): Promise<{ success: boolean; id: string }> {
   return deleteAnnouncementFlow({ id });
 }
+
+// Ensure all necessary types and functions are explicitly exported
+// Schemas and Types are already exported above.
+// Wrapper functions are also exported.
+    
 
     
