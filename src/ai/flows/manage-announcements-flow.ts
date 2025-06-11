@@ -17,12 +17,6 @@ import { z } from 'genkit/zod';
 import mysql from 'mysql2/promise';
 import type { UserRole as AppUserRole } from '@/types';
 
-// TODO: Define your database connection details in .env file
-// Example .env variables:
-// DB_HOST=tu_host
-// DB_USER=tu_usuario
-// DB_PASSWORD=tu_contraseña
-// DB_NAME=tu_base_de_datos
 
 const dbConfig = {
   host: process.env.DB_HOST,
@@ -34,16 +28,19 @@ const dbConfig = {
   queueLimit: 0,
 };
 
-// Create a connection pool
-// TODO: Ensure this pool is managed correctly (e.g., closed on app shutdown if needed)
-// For serverless environments, creating a connection per request might be more appropriate.
 let pool: mysql.Pool | undefined;
 try {
   if (dbConfig.host && dbConfig.user && dbConfig.database) {
     pool = mysql.createPool(dbConfig);
     console.log("MySQL connection pool created successfully.");
+
+    // Test query to confirm connection
+    pool.query('SELECT 1')
+      .then(() => console.log('MySQL connection pool test query successful.'))
+      .catch((err) => console.error('MySQL connection pool test query failed:', err));
+
   } else {
-    console.warn("MySQL DB configuration is incomplete. Flows will not connect to DB.");
+    console.warn("MySQL DB configuration is incomplete. DB_HOST, DB_USER, and DB_NAME must be set in .env. Flows will not connect to DB.");
   }
 } catch (error) {
   console.error("Failed to create MySQL connection pool:", error);
@@ -52,13 +49,16 @@ try {
 
 async function getConnection() {
   if (!pool) {
+    console.error('MySQL connection pool is not initialized. Check DB_CONFIG in .env and server logs.');
     throw new Error('MySQL connection pool is not initialized. Check DB_CONFIG in .env and server logs.');
   }
-  return pool.getConnection();
+  console.log('Attempting to get connection from pool...');
+  const connection = await pool.getConnection();
+  console.log('Successfully got connection from pool.');
+  return connection;
 }
 
 
-// Extended UserRole for 'Todos' in target audience
 const targetAudienceRoleOptions = ['Administrador', 'Instructor', 'Personal', 'Todos'] as const;
 export type TargetAudienceRoleFlow = (typeof targetAudienceRoleOptions)[number];
 
@@ -84,28 +84,20 @@ export type Announcement = z.infer<typeof AnnouncementSchema>;
 
 export const CreateAnnouncementInputSchema = AnnouncementSchema.omit({ 
     id: true, 
-    author: true, // Will be set by the server/logged-in user context
+    author: true, 
     createdAt: true, 
     updatedAt: true 
 });
 export type CreateAnnouncementInput = z.infer<typeof CreateAnnouncementInputSchema>;
 
 export const UpdateAnnouncementInputSchema = AnnouncementSchema.omit({ 
-    author: true, // Should not be changed on update by input
-    createdAt: true, // Should not be changed on update
-    updatedAt: true // Will be set by the server
+    author: true, 
+    createdAt: true, 
+    updatedAt: true 
 }).partial(); 
 export type UpdateAnnouncementInput = z.infer<typeof UpdateAnnouncementInputSchema>;
 
 
-// --- In-memory store (commented out or to be removed) ---
-/*
-let announcementsStore: Announcement[] = [
-  // ... initial data ...
-];
-*/
-
-// Flow for creating an announcement
 const createAnnouncementFlow = ai.defineFlow(
   {
     name: 'createAnnouncementFlow',
@@ -113,15 +105,17 @@ const createAnnouncementFlow = ai.defineFlow(
     outputSchema: AnnouncementSchema,
   },
   async (input) => {
-    if (!pool) throw new Error('Database not configured.');
-    const connection = await getConnection();
+    if (!pool) {
+      console.error('createAnnouncementFlow: Database not configured.');
+      throw new Error('Database not configured.');
+    }
+    let connection: mysql.PoolConnection | undefined;
     try {
+      connection = await getConnection();
       const now = new Date().toISOString();
-      const newId = `ann-${Date.now()}-${Math.random().toString(36).substring(7)}`; // Consider UUIDs for production
+      const newId = \`ann-\${Date.now()}-\${Math.random().toString(36).substring(7)}\`; 
       const author = 'Usuario Actual (Backend)'; // TODO: Replace with actual user context
 
-      // TODO: Adapt SQL query to your table structure.
-      // targetAudience is an array, often stored as JSON string in SQL.
       const sql = \`
         INSERT INTO announcements (id, title, content, urgency, publicationDate, expirationDate, author, targetAudience, isPublished, isSticky, createdAt, updatedAt)
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
@@ -134,14 +128,16 @@ const createAnnouncementFlow = ai.defineFlow(
         new Date(input.publicationDate).toISOString(),
         input.expirationDate ? new Date(input.expirationDate).toISOString() : null,
         author,
-        JSON.stringify(input.targetAudience), // Store as JSON string
+        JSON.stringify(input.targetAudience), 
         input.isPublished,
         input.isSticky,
         now,
         now,
       ];
 
+      console.log('Executing SQL for createAnnouncementFlow:', sql.trim().substring(0, 100) + '...');
       await connection.execute(sql, values);
+      console.log('SQL execution successful for createAnnouncementFlow. ID:', newId);
 
       const newAnnouncement: Announcement = {
         ...input,
@@ -153,8 +149,14 @@ const createAnnouncementFlow = ai.defineFlow(
         updatedAt: now,
       };
       return newAnnouncement;
+    } catch (error) {
+      console.error('Error in createAnnouncementFlow:', error);
+      throw error; // Re-throw para que el frontend lo capture
     } finally {
-      connection.release();
+      if (connection) {
+        console.log('Releasing connection for createAnnouncementFlow.');
+        connection.release();
+      }
     }
   }
 );
@@ -164,7 +166,6 @@ export async function createAnnouncement(input: CreateAnnouncementInput): Promis
 }
 
 
-// Flow for getting all announcements
 const getAnnouncementsFlow = ai.defineFlow(
   {
     name: 'getAnnouncementsFlow',
@@ -172,29 +173,42 @@ const getAnnouncementsFlow = ai.defineFlow(
     outputSchema: z.array(AnnouncementSchema),
   },
   async () => {
-    if (!pool) throw new Error('Database not configured.');
-    const connection = await getConnection();
+    if (!pool) {
+      console.error('getAnnouncementsFlow: Database not configured.');
+      throw new Error('Database not configured.');
+    }
+    let connection: mysql.PoolConnection | undefined;
     try {
-      // TODO: Adapt SQL query to your table structure.
-      const [rows] = await connection.execute('SELECT * FROM announcements ORDER BY createdAt DESC');
+      connection = await getConnection();
+      const sql = 'SELECT * FROM announcements ORDER BY createdAt DESC';
+      console.log('Executing SQL for getAnnouncementsFlow:', sql);
+      const [rows] = await connection.execute(sql);
+      console.log('SQL execution successful for getAnnouncementsFlow. Rows found:', (rows as any[]).length);
       
-      // Assuming rows are of type any[] or RowDataPacket[]
       const announcements = (rows as any[]).map(row => ({
         ...row,
-        // targetAudience might be stored as JSON string, parse it back.
         targetAudience: typeof row.targetAudience === 'string' ? JSON.parse(row.targetAudience) : row.targetAudience,
-        // Ensure boolean values are correct
         isPublished: !!row.isPublished,
         isSticky: !!row.isSticky,
-        // Ensure dates are in ISO string format if not already
         publicationDate: new Date(row.publicationDate).toISOString(),
         expirationDate: row.expirationDate ? new Date(row.expirationDate).toISOString() : null,
         createdAt: new Date(row.createdAt).toISOString(),
         updatedAt: new Date(row.updatedAt).toISOString(),
       }));
-      return AnnouncementSchema.array().parse(announcements); // Validate against Zod schema
+      return AnnouncementSchema.array().parse(announcements); 
+    } catch (error) {
+      console.error('Error in getAnnouncementsFlow:', error);
+      // Si el error es porque la tabla no existe (ER_NO_SUCH_TABLE), retorna un array vacío.
+      if ((error as any).code === 'ER_NO_SUCH_TABLE') {
+        console.warn('Table "announcements" does not exist. Returning empty array for getAnnouncementsFlow.');
+        return [];
+      }
+      throw error; // Re-throw para otros errores
     } finally {
-      connection.release();
+      if (connection) {
+        console.log('Releasing connection for getAnnouncementsFlow.');
+        connection.release();
+      }
     }
   }
 );
@@ -203,7 +217,6 @@ export async function getAnnouncements(): Promise<Announcement[]> {
   return getAnnouncementsFlow();
 }
 
-// Flow for updating an announcement
 const updateAnnouncementFlow = ai.defineFlow(
   {
     name: 'updateAnnouncementFlow',
@@ -214,13 +227,15 @@ const updateAnnouncementFlow = ai.defineFlow(
     outputSchema: AnnouncementSchema,
   },
   async ({ id, data }) => {
-    if (!pool) throw new Error('Database not configured.');
-    const connection = await getConnection();
+    if (!pool) {
+      console.error('updateAnnouncementFlow: Database not configured.');
+      throw new Error('Database not configured.');
+    }
+    let connection: mysql.PoolConnection | undefined;
     try {
+      connection = await getConnection();
       const updatedAt = new Date().toISOString();
       
-      // TODO: Adapt SQL query to your table structure.
-      // Dynamically build the SET part of the query based on fields present in 'data'
       const fieldsToUpdate: string[] = [];
       const values: any[] = [];
 
@@ -239,9 +254,10 @@ const updateAnnouncementFlow = ai.defineFlow(
       });
 
       if (fieldsToUpdate.length === 0) {
-        // No fields to update, fetch and return current state or throw error
+        console.log('updateAnnouncementFlow: No fields to update for id:', id);
         const [currentRows] = await connection.execute('SELECT * FROM announcements WHERE id = ?', [id]);
         if ((currentRows as any[]).length === 0) {
+            console.error(\`updateAnnouncementFlow: Announcement with id \${id} not found when no fields to update.\`);
             throw new Error(\`Announcement with id \${id} not found.\`);
         }
         const currentRow = (currentRows as any[])[0];
@@ -259,17 +275,18 @@ const updateAnnouncementFlow = ai.defineFlow(
 
       fieldsToUpdate.push('`updatedAt` = ?');
       values.push(updatedAt);
-      values.push(id); // For the WHERE clause
+      values.push(id); 
 
       const sql = \`UPDATE announcements SET \${fieldsToUpdate.join(', ')} WHERE id = ?\`;
-      
+      console.log('Executing SQL for updateAnnouncementFlow:', sql.trim().substring(0, 100) + '...');
       const [result] = await connection.execute(sql, values);
+      console.log('SQL execution result for updateAnnouncementFlow:', result);
       
       if ((result as mysql.ResultSetHeader).affectedRows === 0) {
+        console.error(\`updateAnnouncementFlow: Announcement with id \${id} not found or no changes made.\`);
         throw new Error(\`Announcement with id \${id} not found or no changes made.\`);
       }
 
-      // Fetch the updated announcement
       const [updatedRows] = await connection.execute('SELECT * FROM announcements WHERE id = ?', [id]);
       const updatedRow = (updatedRows as any[])[0];
        return AnnouncementSchema.parse({
@@ -282,8 +299,14 @@ const updateAnnouncementFlow = ai.defineFlow(
         createdAt: new Date(updatedRow.createdAt).toISOString(),
         updatedAt: new Date(updatedRow.updatedAt).toISOString(),
       });
+    } catch (error) {
+      console.error('Error in updateAnnouncementFlow:', error);
+      throw error;
     } finally {
-      connection.release();
+      if (connection) {
+        console.log('Releasing connection for updateAnnouncementFlow.');
+        connection.release();
+      }
     }
   }
 );
@@ -292,7 +315,6 @@ export async function updateAnnouncement(id: string, data: UpdateAnnouncementInp
   return updateAnnouncementFlow({ id, data });
 }
 
-// Flow for deleting an announcement
 const deleteAnnouncementFlow = ai.defineFlow(
   {
     name: 'deleteAnnouncementFlow',
@@ -300,19 +322,31 @@ const deleteAnnouncementFlow = ai.defineFlow(
     outputSchema: z.object({ success: z.boolean(), id: z.string() }),
   },
   async ({ id }) => {
-    if (!pool) throw new Error('Database not configured.');
-    const connection = await getConnection();
+    if (!pool) {
+      console.error('deleteAnnouncementFlow: Database not configured.');
+      throw new Error('Database not configured.');
+    }
+    let connection: mysql.PoolConnection | undefined;
     try {
-      // TODO: Adapt SQL query to your table structure.
+      connection = await getConnection();
       const sql = 'DELETE FROM announcements WHERE id = ?';
+      console.log('Executing SQL for deleteAnnouncementFlow:', sql);
       const [result] = await connection.execute(sql, [id]);
+      console.log('SQL execution result for deleteAnnouncementFlow:', result);
 
       if ((result as mysql.ResultSetHeader).affectedRows === 0) {
+        console.error(\`deleteAnnouncementFlow: Announcement with id \${id} not found for deletion.\`);
         throw new Error(\`Announcement with id \${id} not found for deletion.\`);
       }
       return { success: true, id };
+    } catch (error) {
+      console.error('Error in deleteAnnouncementFlow:', error);
+      throw error;
     } finally {
-      connection.release();
+      if (connection) {
+        console.log('Releasing connection for deleteAnnouncementFlow.');
+        connection.release();
+      }
     }
   }
 );
@@ -320,3 +354,5 @@ const deleteAnnouncementFlow = ai.defineFlow(
 export async function deleteAnnouncement(id: string): Promise<{ success: boolean; id: string }> {
   return deleteAnnouncementFlow({ id });
 }
+
+    
