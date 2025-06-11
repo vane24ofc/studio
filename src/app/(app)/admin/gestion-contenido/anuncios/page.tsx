@@ -1,7 +1,7 @@
 
 "use client";
 
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useCallback } from 'react';
 import { PageTitle } from '@/components/shared/PageTitle';
 import { Button } from '@/components/ui/button';
 import {
@@ -22,82 +22,61 @@ import { Popover, PopoverContent, PopoverTrigger } from '@/components/ui/popover
 import { Calendar } from '@/components/ui/calendar';
 import { Badge } from '@/components/ui/badge';
 import { Card, CardContent } from '@/components/ui/card';
-import { PlusCircle, Edit, Trash2, Calendar as CalendarIcon, GripVertical } from 'lucide-react';
+import { PlusCircle, Edit, Trash2, Calendar as CalendarIcon, GripVertical, Loader2 } from 'lucide-react';
 import { useForm, Controller, SubmitHandler } from 'react-hook-form';
 import { zodResolver } from '@hookform/resolvers/zod';
 import { z } from 'zod';
 import { format } from 'date-fns';
 import { es } from 'date-fns/locale';
 import { cn } from '@/lib/utils';
-import type { UserRole as AppUserRole } from '@/types';
+import { useToast } from "@/hooks/use-toast";
 
-type UrgencyLevel = 'Normal' | 'Importante' | 'Urgente' | 'Crítico';
-const urgencyLevels: UrgencyLevel[] = ['Normal', 'Importante', 'Urgente', 'Crítico'];
+import { 
+  getAnnouncements, 
+  createAnnouncement, 
+  updateAnnouncement, 
+  deleteAnnouncement,
+  type Announcement as BackendAnnouncement, // Renamed to avoid conflict
+  type CreateAnnouncementInput,
+  type UpdateAnnouncementInput,
+  type UrgencyLevelFlow,
+  type TargetAudienceRoleFlow
+} from '@/ai/flows/manage-announcements-flow'; // Adjust path as necessary
 
-// Extended UserRole for 'Todos' in target audience
-type TargetAudienceRole = Exclude<AppUserRole, null> | 'Todos';
-const targetAudienceOptions: { id: TargetAudienceRole, label: string }[] = [
+
+// Use backend types for consistency
+const urgencyLevels: UrgencyLevelFlow[] = ['Normal', 'Importante', 'Urgente', 'Crítico'];
+
+const targetAudienceOptions: { id: TargetAudienceRoleFlow, label: string }[] = [
   { id: 'Administrador', label: 'Administradores' },
   { id: 'Instructor', label: 'Instructores' },
   { id: 'Personal', label: 'Personal' },
   { id: 'Todos', label: 'Todos (General)' },
 ];
 
-
+// Frontend interface for state and form (uses Date objects)
 interface Announcement {
   id: string;
   title: string;
   content: string;
-  urgency: UrgencyLevel;
+  urgency: UrgencyLevelFlow;
   publicationDate: Date;
   expirationDate?: Date | null;
   author: string;
-  targetAudience: TargetAudienceRole[];
+  targetAudience: TargetAudienceRoleFlow[];
   isPublished: boolean;
   isSticky: boolean;
   createdAt: Date;
   updatedAt: Date;
 }
 
-const initialAnnouncementsData: Omit<Announcement, 'id' | 'createdAt' | 'updatedAt' | 'author'>[] = [
-  {
-    title: 'Mantenimiento Programado del Sistema',
-    content: 'El sistema estará en mantenimiento este domingo de 02:00 a 04:00 AM.',
-    urgency: 'Urgente',
-    publicationDate: new Date('2024-07-28T10:00:00Z'),
-    expirationDate: new Date('2024-07-29T10:00:00Z'),
-    targetAudience: ['Todos'],
-    isPublished: true,
-    isSticky: true,
-  },
-  {
-    title: 'Nueva Política de Vacaciones 2024',
-    content: 'Se ha actualizado la política de vacaciones. Por favor, revísenla en la sección de documentos.',
-    urgency: 'Importante',
-    publicationDate: new Date('2024-07-25T00:00:00Z'),
-    targetAudience: ['Personal', 'Instructor'],
-    isPublished: true,
-    isSticky: false,
-  },
-  {
-    title: 'Convocatoria Curso de Liderazgo',
-    content: 'Abiertas las inscripciones para el nuevo curso de liderazgo. ¡Cupos limitados!',
-    urgency: 'Normal',
-    publicationDate: new Date('2024-08-01T00:00:00Z'),
-    expirationDate: null,
-    targetAudience: ['Instructor', 'Personal'],
-    isPublished: false,
-    isSticky: false,
-  },
-];
-
 const announcementSchema = z.object({
   title: z.string().min(5, { message: 'El título debe tener al menos 5 caracteres.' }).max(100, { message: 'El título no puede exceder los 100 caracteres.' }),
   content: z.string().min(10, { message: 'El contenido debe tener al menos 10 caracteres.' }),
-  urgency: z.enum(urgencyLevels as [UrgencyLevel, ...UrgencyLevel[]], { required_error: 'Debe seleccionar un nivel de urgencia.' }),
+  urgency: z.enum(urgencyLevels as [UrgencyLevelFlow, ...UrgencyLevelFlow[]], { required_error: 'Debe seleccionar un nivel de urgencia.' }),
   publicationDate: z.date({ required_error: 'La fecha de publicación es obligatoria.' }),
   expirationDate: z.date().nullable().optional(),
-  targetAudience: z.array(z.enum(targetAudienceOptions.map(o => o.id) as [TargetAudienceRole, ...TargetAudienceRole[]]))
+  targetAudience: z.array(z.enum(targetAudienceOptions.map(o => o.id) as [TargetAudienceRoleFlow, ...TargetAudienceRoleFlow[]]))
                   .min(1, { message: 'Debe seleccionar al menos una audiencia.' }),
   isPublished: z.boolean().default(false),
   isSticky: z.boolean().default(false),
@@ -113,25 +92,53 @@ const announcementSchema = z.object({
 
 type AnnouncementFormData = z.infer<typeof announcementSchema>;
 
+// Helper to convert backend announcement (string dates) to frontend (Date objects)
+const mapBackendToFrontend = (backendAnn: BackendAnnouncement): Announcement => ({
+  ...backendAnn,
+  publicationDate: new Date(backendAnn.publicationDate),
+  expirationDate: backendAnn.expirationDate ? new Date(backendAnn.expirationDate) : null,
+  createdAt: new Date(backendAnn.createdAt),
+  updatedAt: new Date(backendAnn.updatedAt),
+});
+
+// Helper to convert frontend form data (Date objects) to backend input (string dates)
+const mapFrontendToBackendInput = (formData: AnnouncementFormData): Omit<CreateAnnouncementInput, 'author'> => ({
+    ...formData,
+    publicationDate: formData.publicationDate.toISOString(),
+    expirationDate: formData.expirationDate ? formData.expirationDate.toISOString() : null,
+});
+
+
 export default function AdminGestionAnunciosPage() {
   const [announcements, setAnnouncements] = useState<Announcement[]>([]);
   const [isCreateDialogOpen, setIsCreateDialogOpen] = useState(false);
   const [isEditDialogOpen, setIsEditDialogOpen] = useState(false);
   const [isDeleteDialogOpen, setIsDeleteDialogOpen] = useState(false);
   const [selectedAnnouncement, setSelectedAnnouncement] = useState<Announcement | null>(null);
+  const [isLoading, setIsLoading] = useState(false);
+  const [isSubmitting, setIsSubmitting] = useState(false);
+  const { toast } = useToast();
+
+  const fetchAnnouncements = useCallback(async () => {
+    setIsLoading(true);
+    try {
+      const backendAnnouncements = await getAnnouncements();
+      setAnnouncements(backendAnnouncements.map(mapBackendToFrontend));
+    } catch (error) {
+      console.error("Error fetching announcements:", error);
+      toast({
+        title: "Error al Cargar Anuncios",
+        description: (error as Error).message || "No se pudieron obtener los anuncios del servidor.",
+        variant: "destructive",
+      });
+    } finally {
+      setIsLoading(false);
+    }
+  }, [toast]);
 
   useEffect(() => {
-    // Simulate fetching data or initializing with mock data
-    setAnnouncements(
-      initialAnnouncementsData.map((ann, index) => ({
-        ...ann,
-        id: `ann-${index + 1}-${Date.now()}`,
-        author: 'Admin Sistema',
-        createdAt: new Date(Date.now() - (initialAnnouncementsData.length - index) * 24 * 60 * 60 * 1000), // Stagger creation dates
-        updatedAt: new Date(Date.now() - (initialAnnouncementsData.length - index) * 24 * 60 * 60 * 1000),
-      }))
-    );
-  }, []);
+    fetchAnnouncements();
+  }, [fetchAnnouncements]);
 
 
   const form = useForm<AnnouncementFormData>({
@@ -152,10 +159,8 @@ export default function AdminGestionAnunciosPage() {
   const watchedTargetAudience = watch("targetAudience");
 
   useEffect(() => {
-    // Handle "Todos" selection logic for targetAudience
     const currentAudience = watchedTargetAudience || [];
     if (currentAudience.includes('Todos') && currentAudience.length > 1) {
-      // If 'Todos' is selected along with others, keep only 'Todos'
       setValue('targetAudience', ['Todos']);
     }
   }, [watchedTargetAudience, setValue]);
@@ -169,7 +174,7 @@ export default function AdminGestionAnunciosPage() {
       publicationDate: new Date(),
       expirationDate: null,
       targetAudience: [],
-      isPublished: true, // Default to published for new announcements
+      isPublished: true,
       isSticky: false,
     });
     setIsCreateDialogOpen(true);
@@ -181,8 +186,8 @@ export default function AdminGestionAnunciosPage() {
       title: announcement.title,
       content: announcement.content,
       urgency: announcement.urgency,
-      publicationDate: announcement.publicationDate,
-      expirationDate: announcement.expirationDate,
+      publicationDate: announcement.publicationDate, // Already a Date object
+      expirationDate: announcement.expirationDate, // Already a Date or null
       targetAudience: announcement.targetAudience,
       isPublished: announcement.isPublished,
       isSticky: announcement.isSticky,
@@ -203,42 +208,66 @@ export default function AdminGestionAnunciosPage() {
     reset(); 
   };
 
-  const onSubmitOps: SubmitHandler<AnnouncementFormData> = (data) => {
+  const onSubmitOps: SubmitHandler<AnnouncementFormData> = async (data) => {
+    setIsSubmitting(true);
     const finalAudience = data.targetAudience.includes('Todos') ? ['Todos'] : data.targetAudience;
-    if (selectedAnnouncement && isEditDialogOpen) { // Editing
-      const updatedAnnouncement: Announcement = {
-        ...selectedAnnouncement,
-        ...data,
-        targetAudience: finalAudience,
-        updatedAt: new Date(),
-      };
-      setAnnouncements(prev => prev.map(ann => ann.id === selectedAnnouncement.id ? updatedAnnouncement : ann));
-    } else { // Creating
-      const newAnnouncement: Announcement = {
-        ...data,
-        id: `ann-${Date.now()}`, 
-        author: 'Admin Actual', 
-        targetAudience: finalAudience,
-        createdAt: new Date(),
-        updatedAt: new Date(),
-      };
-      setAnnouncements(prev => [newAnnouncement, ...prev]);
+    const dataForBackend = {
+      ...data,
+      publicationDate: data.publicationDate.toISOString(),
+      expirationDate: data.expirationDate ? data.expirationDate.toISOString() : null,
+      targetAudience: finalAudience,
+    };
+
+    try {
+      if (selectedAnnouncement && isEditDialogOpen) { // Editing
+        const updateData: UpdateAnnouncementInput = dataForBackend;
+        await updateAnnouncement(selectedAnnouncement.id, updateData);
+        toast({ title: "Anuncio Actualizado", description: "El anuncio se ha actualizado correctamente." });
+      } else { // Creating
+        const createData: CreateAnnouncementInput = dataForBackend;
+        await createAnnouncement(createData);
+        toast({ title: "Anuncio Creado", description: "El nuevo anuncio se ha guardado correctamente." });
+      }
+      await fetchAnnouncements(); // Refresh list
+      handleCloseDialogs();
+    } catch (error) {
+      console.error("Error saving announcement:", error);
+      toast({
+        title: "Error al Guardar",
+        description: (error as Error).message || "No se pudo guardar el anuncio.",
+        variant: "destructive",
+      });
+    } finally {
+      setIsSubmitting(false);
     }
-    handleCloseDialogs();
   };
 
-  const handleDeleteConfirm = () => {
+  const handleDeleteConfirm = async () => {
     if (!selectedAnnouncement) return;
-    setAnnouncements(prev => prev.filter(ann => ann.id !== selectedAnnouncement.id));
-    handleCloseDialogs();
+    setIsSubmitting(true);
+    try {
+      await deleteAnnouncement(selectedAnnouncement.id);
+      toast({ title: "Anuncio Eliminado", description: "El anuncio ha sido eliminado." });
+      await fetchAnnouncements(); // Refresh list
+      handleCloseDialogs();
+    } catch (error) {
+      console.error("Error deleting announcement:", error);
+      toast({
+        title: "Error al Eliminar",
+        description: (error as Error).message || "No se pudo eliminar el anuncio.",
+        variant: "destructive",
+      });
+    } finally {
+      setIsSubmitting(false);
+    }
   };
 
-  const getUrgencyBadgeVariant = (urgency: UrgencyLevel): "default" | "secondary" | "destructive" | "outline" => {
+  const getUrgencyBadgeVariant = (urgency: UrgencyLevelFlow): "default" | "secondary" | "destructive" | "outline" => {
     switch (urgency) {
       case 'Crítico': return 'destructive';
-      case 'Urgente': return 'destructive';
-      case 'Importante': return 'secondary';
-      default: return 'outline';
+      case 'Urgente': return 'destructive'; // Kept 'Urgente' as destructive for emphasis
+      case 'Importante': return 'secondary'; // 'Importante' as secondary (yellowish in some themes)
+      default: return 'outline'; // 'Normal' as outline
     }
   };
 
@@ -246,13 +275,13 @@ export default function AdminGestionAnunciosPage() {
     <div className="grid gap-4 py-4 max-h-[60vh] overflow-y-auto pr-2">
       <div className="grid grid-cols-4 items-center gap-4">
         <Label htmlFor="title" className="text-right">Título</Label>
-        <Input id="title" {...form.register("title")} className="col-span-3" />
+        <Input id="title" {...form.register("title")} className="col-span-3" disabled={isSubmitting} />
       </div>
       {errors.title && <p className="col-start-2 col-span-3 text-sm text-destructive">{errors.title.message}</p>}
 
       <div className="grid grid-cols-4 items-start gap-4">
         <Label htmlFor="content" className="text-right pt-2">Contenido</Label>
-        <Textarea id="content" {...form.register("content")} className="col-span-3 min-h-[100px]" />
+        <Textarea id="content" {...form.register("content")} className="col-span-3 min-h-[100px]" disabled={isSubmitting} />
       </div>
        {errors.content && <p className="col-start-2 col-span-3 text-sm text-destructive">{errors.content.message}</p>}
 
@@ -262,7 +291,7 @@ export default function AdminGestionAnunciosPage() {
           name="urgency"
           control={control}
           render={({ field }) => (
-            <Select onValueChange={field.onChange} value={field.value}>
+            <Select onValueChange={field.onChange} value={field.value} disabled={isSubmitting}>
               <SelectTrigger className="col-span-3">
                 <SelectValue placeholder="Seleccionar urgencia" />
               </SelectTrigger>
@@ -287,6 +316,7 @@ export default function AdminGestionAnunciosPage() {
               <PopoverTrigger asChild>
                 <Button
                   variant={"outline"}
+                  disabled={isSubmitting}
                   className={cn("col-span-3 justify-start text-left font-normal", !field.value && "text-muted-foreground")}
                 >
                   <CalendarIcon className="mr-2 h-4 w-4" />
@@ -294,7 +324,7 @@ export default function AdminGestionAnunciosPage() {
                 </Button>
               </PopoverTrigger>
               <PopoverContent className="w-auto p-0">
-                <Calendar mode="single" selected={field.value} onSelect={field.onChange} initialFocus />
+                <Calendar mode="single" selected={field.value} onSelect={field.onChange} initialFocus disabled={isSubmitting} />
               </PopoverContent>
             </Popover>
           )}
@@ -312,6 +342,7 @@ export default function AdminGestionAnunciosPage() {
               <PopoverTrigger asChild>
                 <Button
                   variant={"outline"}
+                  disabled={isSubmitting}
                   className={cn("col-span-3 justify-start text-left font-normal", !field.value && "text-muted-foreground")}
                 >
                   <CalendarIcon className="mr-2 h-4 w-4" />
@@ -319,7 +350,7 @@ export default function AdminGestionAnunciosPage() {
                 </Button>
               </PopoverTrigger>
               <PopoverContent className="w-auto p-0">
-                <Calendar mode="single" selected={field.value || undefined} onSelect={field.onChange} initialFocus />
+                <Calendar mode="single" selected={field.value || undefined} onSelect={field.onChange} initialFocus disabled={isSubmitting}/>
               </PopoverContent>
             </Popover>
           )}
@@ -337,13 +368,15 @@ export default function AdminGestionAnunciosPage() {
               control={control}
               render={({ field }) => {
                 const isChecked = field.value?.includes(option.id);
-                const isDisabled = field.value?.includes('Todos') && option.id !== 'Todos';
+                const isTodosSelected = field.value?.includes('Todos');
+                const isDisabledByTodos = isTodosSelected && option.id !== 'Todos';
+                
                 return (
                   <div className="flex items-center space-x-2">
                     <Checkbox
                       id={`audience-${option.id}`}
                       checked={isChecked}
-                      disabled={isDisabled}
+                      disabled={isSubmitting || isDisabledByTodos}
                       onCheckedChange={(checked) => {
                         let newValue = [...(field.value || [])];
                         if (option.id === 'Todos') {
@@ -351,8 +384,7 @@ export default function AdminGestionAnunciosPage() {
                         } else {
                           if (checked) {
                             if (!newValue.includes(option.id)) newValue.push(option.id);
-                             // If a specific role is checked, 'Todos' should be unselected
-                            newValue = newValue.filter(id => id !== 'Todos');
+                            newValue = newValue.filter(id => id !== 'Todos'); // Unselect 'Todos' if specific role is selected
                           } else {
                             newValue = newValue.filter(id => id !== option.id);
                           }
@@ -362,7 +394,7 @@ export default function AdminGestionAnunciosPage() {
                     />
                     <label
                       htmlFor={`audience-${option.id}`}
-                      className={cn("text-sm font-medium leading-none peer-disabled:cursor-not-allowed", isDisabled ? "text-muted-foreground opacity-70" : "peer-disabled:opacity-70")}
+                      className={cn("text-sm font-medium leading-none peer-disabled:cursor-not-allowed", (isSubmitting || isDisabledByTodos) ? "text-muted-foreground opacity-70" : "peer-disabled:opacity-70")}
                     >
                       {option.label}
                     </label>
@@ -383,7 +415,7 @@ export default function AdminGestionAnunciosPage() {
                 control={control}
                 render={({ field }) => (
                     <div className="flex items-center space-x-2">
-                        <Checkbox id="isPublished" checked={field.value} onCheckedChange={field.onChange} />
+                        <Checkbox id="isPublished" checked={field.value} onCheckedChange={field.onChange} disabled={isSubmitting} />
                         <Label htmlFor="isPublished">Publicar Anuncio</Label>
                     </div>
                 )}
@@ -393,7 +425,7 @@ export default function AdminGestionAnunciosPage() {
                 control={control}
                 render={({ field }) => (
                     <div className="flex items-center space-x-2">
-                        <Checkbox id="isSticky" checked={field.value} onCheckedChange={field.onChange} />
+                        <Checkbox id="isSticky" checked={field.value} onCheckedChange={field.onChange} disabled={isSubmitting} />
                         <Label htmlFor="isSticky">Destacar (Fijar)</Label>
                     </div>
                 )}
@@ -409,7 +441,7 @@ export default function AdminGestionAnunciosPage() {
         title="Gestión de Anuncios"
         description="Crea, edita y gestiona los anuncios para toda la organización."
         actions={
-          <Button onClick={handleOpenCreateDialog}>
+          <Button onClick={handleOpenCreateDialog} disabled={isLoading || isSubmitting}>
             <PlusCircle className="mr-2 h-5 w-5" />
             Crear Anuncio
           </Button>
@@ -418,6 +450,11 @@ export default function AdminGestionAnunciosPage() {
 
       <Card>
         <CardContent className="p-0">
+          {isLoading ? (
+             <div className="flex justify-center items-center h-64">
+                <Loader2 className="h-8 w-8 animate-spin text-primary" />
+             </div>
+          ) : (
           <Table>
             <TableCaption>
               {announcements.length === 0 ? "No hay anuncios para mostrar." : `Total de anuncios: ${announcements.length}.`}
@@ -441,7 +478,7 @@ export default function AdminGestionAnunciosPage() {
                   <TableCell className="hidden md:table-cell text-muted-foreground hover:text-foreground cursor-grab px-2">
                      <GripVertical className="h-5 w-5" />
                   </TableCell>
-                  <TableCell className="font-medium max-w-xs truncate" title={ann.title}>{ann.title}</TableCell>
+                  <TableCell className="font-medium max-w-[200px] sm:max-w-xs truncate" title={ann.title}>{ann.title}</TableCell>
                   <TableCell className="hidden sm:table-cell">
                     <Badge variant={getUrgencyBadgeVariant(ann.urgency)}>{ann.urgency}</Badge>
                   </TableCell>
@@ -451,7 +488,7 @@ export default function AdminGestionAnunciosPage() {
                   </TableCell>
                   <TableCell className="hidden md:table-cell">
                     {ann.targetAudience.map(aud => (
-                        <Badge key={aud} variant="secondary" className="mr-1 mb-1 capitalize">{aud}</Badge>
+                        <Badge key={aud} variant="secondary" className="mr-1 mb-1 capitalize">{aud === 'Todos' ? 'General' : aud}</Badge>
                     ))}
                   </TableCell>
                   <TableCell className="text-center">
@@ -465,10 +502,10 @@ export default function AdminGestionAnunciosPage() {
                     </Badge>
                   </TableCell>
                   <TableCell className="text-right">
-                    <Button variant="ghost" size="icon" onClick={() => handleOpenEditDialog(ann)} className="hover:text-accent" aria-label="Editar">
+                    <Button variant="ghost" size="icon" onClick={() => handleOpenEditDialog(ann)} className="hover:text-accent" aria-label="Editar" disabled={isSubmitting}>
                       <Edit className="h-4 w-4" />
                     </Button>
-                    <Button variant="ghost" size="icon" onClick={() => handleOpenDeleteDialog(ann)} className="hover:text-destructive" aria-label="Eliminar">
+                    <Button variant="ghost" size="icon" onClick={() => handleOpenDeleteDialog(ann)} className="hover:text-destructive" aria-label="Eliminar" disabled={isSubmitting}>
                       <Trash2 className="h-4 w-4" />
                     </Button>
                   </TableCell>
@@ -476,6 +513,7 @@ export default function AdminGestionAnunciosPage() {
               ))}
             </TableBody>
           </Table>
+          )}
         </CardContent>
       </Card>
 
@@ -488,8 +526,11 @@ export default function AdminGestionAnunciosPage() {
           <form onSubmit={handleSubmit(onSubmitOps)}>
             {renderFormFields()}
             <DialogFooter className="pt-4">
-              <Button type="button" variant="outline" onClick={handleCloseDialogs}>Cancelar</Button>
-              <Button type="submit">Guardar Anuncio</Button>
+              <Button type="button" variant="outline" onClick={handleCloseDialogs} disabled={isSubmitting}>Cancelar</Button>
+              <Button type="submit" disabled={isSubmitting}>
+                {isSubmitting && <Loader2 className="mr-2 h-4 w-4 animate-spin" />}
+                Guardar Anuncio
+              </Button>
             </DialogFooter>
           </form>
         </DialogContent>
@@ -504,8 +545,11 @@ export default function AdminGestionAnunciosPage() {
            <form onSubmit={handleSubmit(onSubmitOps)}>
             {renderFormFields()}
             <DialogFooter className="pt-4">
-              <Button type="button" variant="outline" onClick={handleCloseDialogs}>Cancelar</Button>
-              <Button type="submit">Guardar Cambios</Button>
+              <Button type="button" variant="outline" onClick={handleCloseDialogs} disabled={isSubmitting}>Cancelar</Button>
+              <Button type="submit" disabled={isSubmitting}>
+                 {isSubmitting && <Loader2 className="mr-2 h-4 w-4 animate-spin" />}
+                Guardar Cambios
+              </Button>
             </DialogFooter>
           </form>
         </DialogContent>
@@ -522,8 +566,13 @@ export default function AdminGestionAnunciosPage() {
             </AlertDialogDescription>
           </AlertDialogHeader>
           <AlertDialogFooter>
-            <AlertDialogCancel onClick={handleCloseDialogs}>Cancelar</AlertDialogCancel>
-            <AlertDialogAction onClick={handleDeleteConfirm} className="bg-destructive hover:bg-destructive/90 text-destructive-foreground">
+            <AlertDialogCancel onClick={handleCloseDialogs} disabled={isSubmitting}>Cancelar</AlertDialogCancel>
+            <AlertDialogAction 
+                onClick={handleDeleteConfirm} 
+                className="bg-destructive hover:bg-destructive/90 text-destructive-foreground"
+                disabled={isSubmitting}
+            >
+              {isSubmitting && <Loader2 className="mr-2 h-4 w-4 animate-spin" />}
               Sí, eliminar
             </AlertDialogAction>
           </AlertDialogFooter>
@@ -532,4 +581,3 @@ export default function AdminGestionAnunciosPage() {
     </div>
   );
 }
-
